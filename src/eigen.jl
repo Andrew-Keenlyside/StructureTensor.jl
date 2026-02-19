@@ -96,17 +96,24 @@ function eig_special_3d(S::AbstractArray{<:Real, 4};
         vec = Array{Float64}(undef, 3, dims...)
     end
 
+    # Reshape to 2D for unambiguous [component, voxel] indexing.
+    # Julia treats A[i, j] on an N-D array as Cartesian into dim i and dim j
+    # (not trailing-linear), so we must flatten the spatial dims first.
+    Sf_mat  = reshape(Sf,  6, nvox)
+    val_mat = reshape(val, 3, nvox)
+    vec_mat = full ? reshape(vec, 3, 3, nvox) : reshape(vec, 3, nvox)
+
     # ── Element-wise eigendecomposition using Cardano's formula ──────────
     # Process each voxel. We use @inbounds and linear indexing for speed.
     # The inner function is kept small to aid compiler optimisation.
     Threads.@threads for idx in 1:nvox
         # Extract the 6 unique components of the 3×3 symmetric matrix
-        sxx = Sf[1, idx]
-        syy = Sf[2, idx]
-        szz = Sf[3, idx]
-        sxy = Sf[4, idx]
-        sxz = Sf[5, idx]
-        syz = Sf[6, idx]
+        sxx = Sf_mat[1, idx]
+        syy = Sf_mat[2, idx]
+        szz = Sf_mat[3, idx]
+        sxy = Sf_mat[4, idx]
+        sxz = Sf_mat[5, idx]
+        syz = Sf_mat[6, idx]
 
         # ── Cardano's formula for 3×3 symmetric eigenvalues ──────────
         # Step 1: Compute mean of diagonal (trace / 3)
@@ -156,13 +163,13 @@ function eig_special_3d(S::AbstractArray{<:Real, 4};
 
         # Store eigenvalues in requested order
         if eigenvalue_order == :asc
-            @inbounds val[1, idx] = λ1  # smallest
-            @inbounds val[2, idx] = λ2  # middle
-            @inbounds val[3, idx] = λ3  # largest
+            @inbounds val_mat[1, idx] = λ1  # smallest
+            @inbounds val_mat[2, idx] = λ2  # middle
+            @inbounds val_mat[3, idx] = λ3  # largest
         else
-            @inbounds val[1, idx] = λ3  # largest
-            @inbounds val[2, idx] = λ2  # middle
-            @inbounds val[3, idx] = λ1  # smallest
+            @inbounds val_mat[1, idx] = λ3  # largest
+            @inbounds val_mat[2, idx] = λ2  # middle
+            @inbounds val_mat[3, idx] = λ1  # smallest
         end
 
         # ── Eigenvector computation ──────────────────────────────────
@@ -181,18 +188,18 @@ function eig_special_3d(S::AbstractArray{<:Real, 4};
             for (vi, λ) in enumerate(eig_vals)
                 vx, vy, vz = _eigvec_from_eigenvalue(
                     sxx, syy, szz, sxy, sxz, syz, λ)
-                @inbounds vec[1, vi, idx] = vx
-                @inbounds vec[2, vi, idx] = vy
-                @inbounds vec[3, vi, idx] = vz
+                @inbounds vec_mat[1, vi, idx] = vx
+                @inbounds vec_mat[2, vi, idx] = vy
+                @inbounds vec_mat[3, vi, idx] = vz
             end
         else
             # Only compute the eigenvector for the smallest eigenvalue
             λ_small = eigenvalue_order == :asc ? λ1 : λ3
             vx, vy, vz = _eigvec_from_eigenvalue(
                 sxx, syy, szz, sxy, sxz, syz, λ_small)
-            @inbounds vec[1, idx] = vx
-            @inbounds vec[2, idx] = vy
-            @inbounds vec[3, idx] = vz
+            @inbounds vec_mat[1, idx] = vx
+            @inbounds vec_mat[2, idx] = vy
+            @inbounds vec_mat[3, idx] = vz
         end
     end
 

@@ -271,3 +271,67 @@ function parallel_structure_tensor_analysis(volume::AbstractArray{<:Real, 3},
         return nothing, val, vec
     end
 end
+
+
+
+
+using CUDA
+
+# Reuse your halo/range helpers
+# _compute_halo(σ, ρ, truncate)
+# _chunk_ranges(total_size, chunk_size, halo)
+
+"""
+    structure_tensor_3d_chunked_gpu(volume_cpu, σ, ρ;
+        chunk_size=128, truncate=4.0, verbose=false, device=0) -> S_cpu
+
+Out-of-core chunked structure tensor:
+- volume_cpu stays on CPU (or any indexable array-like)
+- each chunk is transferred to GPU, processed, and copied back
+- output S is a CPU Array{Float64,4} of size (6, nx, ny, nz)
+
+REQUIRES: a CUDA-capable method `structure_tensor_3d(::CuArray, σ, ρ; truncate=...)`.
+"""
+
+
+function structure_tensor_3d_chunked_gpu(volume_cpu::AbstractArray{<:Real,3},
+    σ::Real, ρ::Real;
+    chunk_size::Int=128,
+    truncate::Real=4.0)
+    dims = size(volume_cpu)
+    halo = _compute_halo(σ, ρ, truncate)
+
+    rx = _chunk_ranges(dims[1], chunk_size, halo)
+    ry = _chunk_ranges(dims[2], chunk_size, halo)
+    rz = _chunk_ranges(dims[3], chunk_size, halo)
+
+    S_out = Array{Float64}(undef, 6, dims...)
+
+    for ix in eachindex(rx), iy in eachindex(ry), iz in eachindex(rz)
+        (pad_x, inner_x) = rx[ix]
+        (pad_y, inner_y) = ry[iy]
+        (pad_z, inner_z) = rz[iz]
+
+        block_cpu = Float32.(volume_cpu[pad_x, pad_y, pad_z])  # compact + smaller
+        block_gpu = CuArray(block_cpu)
+
+        S_block_gpu = structure_tensor_3d(block_gpu, σ, ρ; truncate=truncate)
+        CUDA.synchronize()
+
+        S_block = Array(S_block_gpu)  # D2H once
+
+        out_x = first(pad_x)+first(inner_x)-1 : first(pad_x)+last(inner_x)-1
+        out_y = first(pad_y)+first(inner_y)-1 : first(pad_y)+last(inner_y)-1
+        out_z = first(pad_z)+first(inner_z)-1 : first(pad_z)+last(inner_z)-1
+
+        @inbounds for c in 1:6
+            @views S_out[c, out_x, out_y, out_z] .= S_block[c, inner_x, inner_y, inner_z]
+        end
+
+        CUDA.unsafe_free!(block_gpu)
+        CUDA.unsafe_free!(S_block_gpu)
+    end
+
+    return S_out
+end
+

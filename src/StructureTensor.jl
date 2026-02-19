@@ -54,6 +54,7 @@ include("io.jl")
 export structure_tensor_3d,
        eig_special_3d,
        structure_tensor_3d_chunked,
+       structure_tensor_3d_chunked_gpu,
        parallel_structure_tensor_analysis,
        process_volume
 

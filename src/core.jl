@@ -1,23 +1,32 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# core.jl — Core 3D structure tensor computation (CPU)
+# core.jl — Core 3D structure tensor computation (CPU, high-performance)
 #
-# Faithful port of `structure_tensor.st3d.structure_tensor_3d` from the Python
-# `structure-tensor` package by Niels Jeppesen (Skielex).
+# Drop-in replacement for the ImageFiltering-based implementation.
+# Designed to match or beat scipy.ndimage.gaussian_filter performance.
+#
+# Architecture:
+#   • dim1 convolution: padded line-buffer (like scipy's correlate1d in C)
+#     — copies each contiguous line into a padded scratch buffer, then
+#       convolves with zero branches in the hot loop.  @fastmath @simd
+#       vectorises across i (stride-1 reads from both buffer and output).
+#
+#   • dim2/dim3 convolution: scatter-accumulate pattern
+#     — outer loop over kernel taps, inner @fastmath @simd loop does
+#       out[i] += inp[i, jj/kk] * weight.  This is a simple axpy on
+#       contiguous memory that compilers vectorise perfectly.  The clamp
+#       is hoisted out of the SIMD loop entirely.
+#
+#   • Shared intermediates: 8 convolution passes for 3 gradients (not 9)
+#   • Buffer reuse: 4 working arrays, pointer swaps instead of copies
+#   • Fused product→smooth→store: one component at a time, low peak memory
+#   • Multi-threaded via Threads.@threads (set JULIA_NUM_THREADS)
 #
 # The structure tensor S of a 3D volume V at each voxel is defined as:
-#
 #   S = Gρ ⊛ (∇σV · ∇σVᵀ)
-#
-# where ∇σV is the gradient of V smoothed with a Gaussian of width σ (the
-# "noise scale"), and Gρ is a Gaussian of width ρ (the "integration scale")
-# that averages the outer product over a local neighbourhood.
 #
 # The resulting 3×3 symmetric tensor is stored as 6 unique components:
 #   S[1,...] = Sxx,  S[2,...] = Syy,  S[3,...] = Szz,
 #   S[4,...] = Sxy,  S[5,...] = Sxz,  S[6,...] = Syz
-#
-# This matches the Python package's convention:
-#   S = (s_xx, s_yy, s_zz, s_xy, s_xz, s_yz)
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── 1D Gaussian kernel (matching scipy.ndimage.gaussian_filter1d) ────────────
@@ -27,94 +36,199 @@
 
 Compute a 1D Gaussian kernel or its first derivative, exactly matching the
 behaviour of `scipy.ndimage.gaussian_filter1d`.
-
-# Arguments
-- `σ`: Standard deviation of the Gaussian (in voxels).
-- `order`: Derivative order. `0` for smoothing, `1` for first derivative.
-- `truncate`: Number of standard deviations at which to truncate the kernel.
-
-# Returns
-A `Vector{Float64}` containing the normalised kernel coefficients.
-
-# Notes
-For `order == 0`, returns the normalised Gaussian g(x) = exp(-x²/2σ²) / Σg.
-For `order == 1`, returns g'(x) = (-x/σ²) · g(x) / Σg, where Σg is the sum
-of the un-derived Gaussian. This is identical to scipy's implementation.
 """
 function _gaussian_kernel1d(σ::Real, order::Int, truncate::Real)
-    @assert order in (0, 1) "Only order 0 (smoothing) and 1 (first derivative) are supported."
+    @assert order in (0, 1) "Only order 0 and 1 supported."
     @assert σ > 0 "σ must be positive, got $σ."
 
-    # Half-width of the kernel, matching scipy's `lw = int(truncate * sd + 0.5)`
     lw = round(Int, truncate * σ + 0.5)
-
-    # Sample positions (integer offsets from centre)
     x = collect(Float64, -lw:lw)
-
-    # Un-normalised Gaussian
     σ2 = σ * σ
     phi = @. exp(-0.5 * x^2 / σ2)
-
-    # Normalise so that the smoothing kernel sums to 1
     phi_sum = sum(phi)
     phi ./= phi_sum
 
     if order == 1
-        # First derivative: multiply by -x/σ² (applied to the already-normalised kernel)
         phi .*= @. -x / σ2
     end
 
     return phi
 end
 
-# ── Separable Gaussian derivative filtering ──────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# CONVOLUTION ALONG DIM 1 — padded line-buffer approach
+#
+# This mirrors scipy's correlate1d: for each 1D line along the convolution
+# axis, copy into a padded buffer with replicated boundaries, then run a
+# tight dot-product loop with zero branches.
+#
+# The @fastmath @simd on the i-loop processes 4 doubles simultaneously
+# (AVX2).  For each kernel tap m, it loads buf[i+m-1 : i+m+2] (contiguous!)
+# and does an FMA with kern[m].  No clamp, no branch, no gather.
+# ──────────────────────────────────────────────────────────────────────────────
+
+function _conv1d_dim1!(out::Array{Float64,3},
+                       inp::Array{Float64,3},
+                       kern::Vector{Float64})
+    n1, n2, n3 = size(inp)
+    hk = length(kern) >> 1
+    klen = length(kern)
+    buflen = n1 + 2 * hk
+
+    # Pre-allocate one padded buffer per thread
+    nbufs = Threads.maxthreadid()  # safe for indexing by Threads.threadid()
+    bufs = [Vector{Float64}(undef, buflen) for _ in 1:nbufs]
+    
+
+    Threads.@threads for k in 1:n3
+        buf = bufs[Threads.threadid()]
+        @inbounds for j in 1:n2
+            # ── Fill padded buffer: [replicate_left | data | replicate_right]
+            left_val  = inp[1,  j, k]
+            right_val = inp[n1, j, k]
+            for p in 1:hk
+                buf[p] = left_val
+            end
+            @simd for i in 1:n1
+                buf[hk + i] = inp[i, j, k]
+            end
+            for p in 1:hk
+                buf[hk + n1 + p] = right_val
+            end
+            # ── Convolve: zero branches, stride-1 access on buf
+            @fastmath @simd for i in 1:n1
+                s = 0.0
+                for m in 1:klen
+                    s += buf[i + m - 1] * kern[m]
+                end
+                out[i, j, k] = s
+            end
+        end
+    end
+    return out
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONVOLUTION ALONG DIM 2 — scatter-accumulate pattern
+#
+# Instead of: for each output voxel, sum over kernel taps (inner loop
+# prevents SIMD because of variable addressing + reduction),
+#
+# We do: for each kernel tap, SIMD-accumulate into the output.
+#   out[:, j, k] += inp[:, clamp(j+m), k] * kern[m]
+#
+# The inner @simd loop is a simple  a[i] += b[i] * scalar  on contiguous
+# memory — this is a textbook axpy that compilers vectorise perfectly.
+# The clamp is computed once per (j, m) pair, completely outside the SIMD
+# loop.
+# ──────────────────────────────────────────────────────────────────────────────
+
+function _conv1d_dim2!(out::Array{Float64,3},
+                       inp::Array{Float64,3},
+                       kern::Vector{Float64})
+    n1, n2, n3 = size(inp)
+    hk = length(kern) >> 1
+
+    Threads.@threads for k in 1:n3
+        # Zero the output slice for this k
+        @inbounds for j in 1:n2
+            @simd for i in 1:n1
+                out[i, j, k] = 0.0
+            end
+        end
+        # Accumulate kernel taps
+        @inbounds for j in 1:n2
+            for m in -hk:hk
+                jj = clamp(j + m, 1, n2)
+                w  = kern[m + hk + 1]
+                # ── This is the hot loop: simple axpy, fully SIMD-able
+                @fastmath @simd for i in 1:n1
+                    out[i, j, k] += inp[i, jj, k] * w
+                end
+            end
+        end
+    end
+    return out
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONVOLUTION ALONG DIM 3 — scatter-accumulate pattern (same idea as dim2)
+#
+# out[:, j, k] += inp[:, j, clamp(k+m)] * kern[m]
+#
+# Access inp[:, j, kk] is contiguous in i (stride 1) even though varying
+# kk has stride n1*n2.  The @simd loop vectorises the i-direction.
+# ──────────────────────────────────────────────────────────────────────────────
+
+function _conv1d_dim3!(out::Array{Float64,3},
+                       inp::Array{Float64,3},
+                       kern::Vector{Float64})
+    n1, n2, n3 = size(inp)
+    hk = length(kern) >> 1
+
+    Threads.@threads for j in 1:n2
+        # Zero output for this j-plane
+        @inbounds for k in 1:n3
+            @simd for i in 1:n1
+                out[i, j, k] = 0.0
+            end
+        end
+        # Accumulate kernel taps
+        @inbounds for k in 1:n3
+            for m in -hk:hk
+                kk = clamp(k + m, 1, n3)
+                w  = kern[m + hk + 1]
+                @fastmath @simd for i in 1:n1
+                    out[i, j, k] += inp[i, j, kk] * w
+                end
+            end
+        end
+    end
+    return out
+end
+
+# ── Helper: isotropic 3-pass smoothing ───────────────────────────────────────
+
+"""
+    _smooth3d!(a, b, k) → result_array
+
+3-pass separable Gaussian smoothing.  Input in `a`.
+Returns whichever buffer holds the result (always `b`).
+"""
+function _smooth3d!(a::Array{Float64,3}, b::Array{Float64,3},
+                    k::Vector{Float64})
+    _conv1d_dim1!(b, a, k)   # a → b
+    _conv1d_dim2!(a, b, k)   # b → a
+    _conv1d_dim3!(b, a, k)   # a → b
+    return b
+end
+
+# ── Public API (backward-compatible) ─────────────────────────────────────────
 
 """
     _gaussian_filter_3d!(out, volume, σ, order; truncate=4.0)
 
-Apply a separable Gaussian (derivative) filter to a 3D volume, writing the
-result into `out`. This mirrors `scipy.ndimage.gaussian_filter(volume, σ,
-order=order, mode="nearest", truncate=truncate)`.
-
-# Arguments
-- `out`: Pre-allocated output array (same size as `volume`).
-- `volume`: Input 3D array.
-- `σ`: Gaussian standard deviation (scalar, applied isotropically).
-- `order`: Tuple of three integers `(o1, o2, o3)` specifying the derivative
-           order along each dimension. E.g., `(1, 0, 0)` computes ∂/∂dim1.
-- `truncate`: Kernel truncation in units of σ (default `4.0`).
-
-# Notes
-Boundary handling uses `"replicate"` (nearest-neighbour extension), which
-corresponds to `mode="nearest"` in scipy.
+Separable Gaussian (derivative) filter matching `scipy.ndimage.gaussian_filter`.
 """
 function _gaussian_filter_3d!(out::AbstractArray{T,3},
                               volume::AbstractArray{<:Real,3},
                               σ::Real,
                               order::NTuple{3,Int};
                               truncate::Real = 4.0) where {T}
-    # Build 1D kernels for each dimension (order specifies derivative along each axis)
     k1 = _gaussian_kernel1d(σ, order[1], truncate)
     k2 = _gaussian_kernel1d(σ, order[2], truncate)
     k3 = _gaussian_kernel1d(σ, order[3], truncate)
-
-    # Create centred kernel factors for separable convolution.
-    # ImageFiltering uses centred indexing by default with `centered()`.
-    kern = (ImageFiltering.centered(k1),
-            ImageFiltering.centered(k2),
-            ImageFiltering.centered(k3))
-
-    # Apply separable convolution with replicate (nearest) boundary padding.
-    # This matches scipy's mode="nearest".
-    imfilter!(out, volume, kern, Pad(:replicate))
-
+    a = convert(Array{Float64}, volume)
+    b = similar(a)
+    _conv1d_dim1!(b, a, k1)
+    _conv1d_dim2!(a, b, k2)
+    _conv1d_dim3!(b, a, k3)
+    out .= b
     return out
 end
 
 """
     _gaussian_filter_3d(volume, σ, order; truncate=4.0) → Array
-
-Allocating version of [`_gaussian_filter_3d!`](@ref).
 """
 function _gaussian_filter_3d(volume::AbstractArray{T,3},
                              σ::Real,
@@ -131,143 +245,98 @@ end
 
 Compute the 3D structure tensor of a volume.
 
-The structure tensor encodes the local orientation and anisotropy of
-intensity gradients in a 3D image. At each voxel, the 3×3 symmetric
-tensor is stored as 6 unique components.
-
-# Arguments
-- `volume::AbstractArray{<:Real, 3}`: Input 3D volume. Will be converted to
-  `Float64` internally if not already floating point. Non-floating-point input
-  will trigger a warning, matching the Python package's behaviour.
-- `σ::Real`: Noise scale (inner scale). Standard deviation of the Gaussian
-  used for computing image gradients. Controls the scale at which gradients
-  are estimated — small σ captures fine detail, large σ captures coarse
-  structure.
-- `ρ::Real`: Integration scale (outer scale). Standard deviation of the
-  Gaussian used to smooth the outer product of gradients. Controls the size
-  of the neighbourhood over which orientation is averaged.
-
-# Keyword Arguments
-- `truncate::Real = 4.0`: Truncation of the Gaussian kernel in units of σ
-  (or ρ). The kernel half-width is `round(Int, truncate * σ + 0.5)`. Matches
-  scipy's `truncate` parameter.
-
-# Returns
-- `S::Array{Float64, 4}`: Structure tensor with shape `(6, nx, ny, nz)`.
-  Components are ordered as:
-  - `S[1,:,:,:]` = Sxx  (∂V/∂dim1 · ∂V/∂dim1)
-  - `S[2,:,:,:]` = Syy  (∂V/∂dim2 · ∂V/∂dim2)
-  - `S[3,:,:,:]` = Szz  (∂V/∂dim3 · ∂V/∂dim3)
-  - `S[4,:,:,:]` = Sxy  (∂V/∂dim1 · ∂V/∂dim2)
-  - `S[5,:,:,:]` = Sxz  (∂V/∂dim1 · ∂V/∂dim3)
-  - `S[6,:,:,:]` = Syz  (∂V/∂dim2 · ∂V/∂dim3)
-
-# Mathematical Background
-The structure tensor at each voxel is:
-
-    S = Gρ ⊛ (∇σV ⊗ ∇σV)
-
-where ∇σV is the gradient computed after Gaussian smoothing with scale σ,
-⊗ denotes the outer product, and Gρ is a Gaussian kernel with scale ρ
-applied for spatial averaging.
-
-# Example
-```julia
-using StructureTensor
-
-volume = randn(128, 128, 128)
-σ = 1.5  # noise scale
-ρ = 5.5  # integration scale
-
-S = structure_tensor_3d(volume, σ, ρ)
-val, vec = eig_special_3d(S)
-```
-
-# Correspondence to Python
-This function is equivalent to `structure_tensor.structure_tensor_3d(volume, sigma, rho)`.
-The gradient conventions match exactly:
-- `Vx` (dim 1) ↔ Python's `order=(1,0,0)` → `Vz` in Python naming
-- `Vy` (dim 2) ↔ Python's `order=(0,1,0)` → `Vy` in Python naming
-- `Vz` (dim 3) ↔ Python's `order=(0,0,1)` → `Vx` in Python naming
-
-The output S is stored in the same order `(Sxx, Syy, Szz, Sxy, Sxz, Syz)`
-with the axis correspondence above, yielding identical numerical results when
-applied to the same data with the same axis ordering.
+# Performance notes
+- Set `JULIA_NUM_THREADS` for multi-threaded convolution.
+- dim1 uses a padded line-buffer (like scipy's C correlate1d): zero branches
+  in the hot loop, perfect SIMD vectorisation.
+- dim2/dim3 use the scatter-accumulate pattern: the inner SIMD loop is a
+  simple  `out[i] += inp[i] * weight`  — textbook axpy that compilers
+  handle perfectly.  Boundary clamping is hoisted outside the SIMD loop.
+- Gradient computation shares intermediates (8 passes instead of 9).
+- Buffer reuse + pointer swaps minimise allocations.
 """
 function structure_tensor_3d(volume::AbstractArray{<:Real, 3},
                              σ::Real,
                              ρ::Real;
                              truncate::Real = 4.0)
-    # ── Input validation ─────────────────────────────────────────────────
     @assert σ > 0 "σ must be positive, got $σ."
     @assert ρ > 0 "ρ must be positive, got $ρ."
     @assert ndims(volume) == 3 "Input must be a 3D array."
 
-    # Warn if input is not floating point (matching Python behaviour)
     if !(eltype(volume) <: AbstractFloat)
         @warn "volume is not a floating-point array. This may result in " *
               "loss of precision and unexpected behaviour."
     end
 
-    # Convert to Float64 for numerical stability
     vol = convert(Array{Float64}, volume)
-
-    # ── Compute Gaussian-smoothed gradients ──────────────────────────────
-    # Derivative along each dimension using Gaussian derivative filters.
-    # This matches the Python code:
-    #   Vx = gaussian_filter(volume, sigma, order=(0,0,1), ...)  ← deriv along axis 2 (last)
-    #   Vy = gaussian_filter(volume, sigma, order=(0,1,0), ...)  ← deriv along axis 1
-    #   Vz = gaussian_filter(volume, sigma, order=(1,0,0), ...)  ← deriv along axis 0 (first)
-    #
-    # In Julia (column-major), we map these to:
-    #   V1 = derivative along dim 1  ↔  Python's Vz (axis 0)
-    #   V2 = derivative along dim 2  ↔  Python's Vy (axis 1)
-    #   V3 = derivative along dim 3  ↔  Python's Vx (axis 2)
-    #
-    # For identical numerical results on the SAME data layout, we use the
-    # same (o1,o2,o3) tuples as the Python code. Since the user's data is
-    # typically loaded with the same physical meaning per axis, the structure
-    # tensor components will be consistent.
-
-    V1 = _gaussian_filter_3d(vol, σ, (1, 0, 0); truncate = truncate)  # ∂V/∂dim1
-    V2 = _gaussian_filter_3d(vol, σ, (0, 1, 0); truncate = truncate)  # ∂V/∂dim2
-    V3 = _gaussian_filter_3d(vol, σ, (0, 0, 1); truncate = truncate)  # ∂V/∂dim3
-
-    # ── Compute outer product components ─────────────────────────────────
-    # Allocate output: 6 components × volume dimensions
     dims = size(vol)
-    S = Array{Float64}(undef, 6, dims...)
 
-    # Sxx = V1 * V1   (component 1)
-    @views @. S[1, :, :, :] = V1 * V1
-    # Syy = V2 * V2   (component 2)
-    @views @. S[2, :, :, :] = V2 * V2
-    # Szz = V3 * V3   (component 3)
-    @views @. S[3, :, :, :] = V3 * V3
-    # Sxy = V1 * V2   (component 4)
-    @views @. S[4, :, :, :] = V1 * V2
-    # Sxz = V1 * V3   (component 5)
-    @views @. S[5, :, :, :] = V1 * V3
-    # Syz = V2 * V3   (component 6)
-    @views @. S[6, :, :, :] = V2 * V3
+    # ── Build kernels once ───────────────────────────────────────────────
+    k_smooth = _gaussian_kernel1d(σ, 0, truncate)
+    k_deriv  = _gaussian_kernel1d(σ, 1, truncate)
+    k_rho    = _gaussian_kernel1d(ρ, 0, truncate)
 
-    # Free gradient arrays to reduce peak memory usage
-    V1 = V2 = V3 = nothing
-
-    # ── Smooth each component with Gρ (integration scale) ───────────────
-    # Build the smoothing kernel once (no derivatives, order=(0,0,0))
-    smooth_k1 = ImageFiltering.centered(_gaussian_kernel1d(ρ, 0, truncate))
-    smooth_k2 = ImageFiltering.centered(_gaussian_kernel1d(ρ, 0, truncate))
-    smooth_k3 = ImageFiltering.centered(_gaussian_kernel1d(ρ, 0, truncate))
-    smooth_kern = (smooth_k1, smooth_k2, smooth_k3)
-
-    # Temporary buffer for in-place smoothing
+    # ── Allocate working buffers (4 volumes, reused throughout) ──────────
+    V1  = similar(vol)
+    V2  = similar(vol)
+    V3  = similar(vol)
     tmp = similar(vol)
-    for c in 1:6
-        component = @view S[c, :, :, :]
-        imfilter!(tmp, component, smooth_kern, Pad(:replicate))
-        component .= tmp
+
+    # ── Compute gradients with shared intermediates (8 passes) ───────────
+    #
+    #   V1 = deriv_d1(vol) → smooth_d2 → smooth_d3
+    #   V2 = smooth_d1(vol) → deriv_d2 → smooth_d3
+    #   V3 = smooth_d1(vol) → smooth_d2 → deriv_d3
+    #
+    # smooth_d1(vol) is shared between V2 and V3.
+
+    # Shared: smooth along dim1
+    _conv1d_dim1!(V2, vol, k_smooth)              #                          [1]
+
+    # V3: smooth_d1 → smooth_d2 → deriv_d3
+    _conv1d_dim2!(V3, V2, k_smooth)               #                          [2]
+    _conv1d_dim3!(tmp, V3, k_deriv)               #                          [3]
+    V3, tmp = tmp, V3                             # pointer swap
+
+    # V2: smooth_d1 → deriv_d2 → smooth_d3
+    _conv1d_dim2!(tmp, V2, k_deriv)               #                          [4]
+    _conv1d_dim3!(V2, tmp, k_smooth)              #                          [5]
+
+    # V1: deriv_d1 → smooth_d2 → smooth_d3
+    _conv1d_dim1!(tmp, vol, k_deriv)              #                          [6]
+    _conv1d_dim2!(V1, tmp, k_smooth)              #                          [7]
+    _conv1d_dim3!(tmp, V1, k_smooth)              #                          [8]
+    V1, tmp = tmp, V1                             # pointer swap
+
+    # V1, V2, V3 = gradient components.  vol and tmp are free scratch.
+
+    # ── Compute outer products, smooth with Gρ, store into S ─────────────
+    S = Array{Float64}(undef, 6, dims...)
+    N = prod(dims)
+    S_flat   = reshape(S, 6, N)
+    vol_flat = reshape(vol, N)
+    V1_flat  = reshape(V1, N)
+    V2_flat  = reshape(V2, N)
+    V3_flat  = reshape(V3, N)
+
+    # Process one tensor component at a time: product → smooth → store
+    @inline function _process_component!(c, a_flat, b_flat)
+        @inbounds @fastmath @simd for i in 1:N
+            vol_flat[i] = a_flat[i] * b_flat[i]
+        end
+        result = _smooth3d!(vol, tmp, k_rho)
+        result_flat = reshape(result, N)
+        @inbounds for i in 1:N
+            S_flat[c, i] = result_flat[i]
+        end
     end
+
+    _process_component!(1, V1_flat, V1_flat)    # Sxx
+    _process_component!(2, V2_flat, V2_flat)    # Syy
+    _process_component!(3, V3_flat, V3_flat)    # Szz
+    _process_component!(4, V1_flat, V2_flat)    # Sxy
+    _process_component!(5, V1_flat, V3_flat)    # Sxz
+    _process_component!(6, V2_flat, V3_flat)    # Syz
 
     return S
 end
