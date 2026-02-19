@@ -2,7 +2,7 @@
 > This package is a Julia port of the Python [`structure-tensor`](https://github.com/Skielex/structure-tensor) package by Niels Jeppesen (Skielex). The mathematics and algorithmic structure are kept identical to the original.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Andrew-Keenlyside/StructureTensor.jl/main/docs/src/assets/banner.png" alt="StructureTensor.jl" width="700"/>
+  <img src="assets/StructureTensor.png" alt="StructureTensor.jl" width="700"/>
 </p>
 
 # **StructureTensor.jl**
