@@ -149,6 +149,16 @@ function _load_volume(::Val{fmt}, path::AbstractString) where {fmt}
           "Then load it with: using $pkg")
 end
 
+# Dispatch concrete loaders by format
+_load_volume(::Val{:tiff},     path::AbstractString) = _load_tiff(path)
+_load_volume(::Val{:tiff_dir}, path::AbstractString) = _load_tiff_dir(path)
+_load_volume(::Val{:nifti},    path::AbstractString) = _load_nifti(path)
+_load_volume(::Val{:nifti_gz}, path::AbstractString) = _load_nifti(path)
+_load_volume(::Val{:mgz},      path::AbstractString) = _load_mgz(path)
+_load_volume(::Val{:zarr},     path::AbstractString) = _load_zarr(path)
+_load_volume(::Val{:ome_zarr}, path::AbstractString) = _load_zarr(path)
+_load_volume(::Val{:npy},      path::AbstractString) = _load_npy(path)
+
 # ── Concrete loaders (guarded by package availability) ───────────────────────
 # These are overridden when the user loads the relevant I/O packages.
 # The pattern uses @eval to define methods only when packages are available.
@@ -182,7 +192,7 @@ end
 
 # NIfTI
 function _load_nifti(path::AbstractString)
-    NIfTI_mod = Base.require(Base.PkgId(Base.UUID("a3a9e032-41b5-5fc4-9215-675ec1cde510"), "NIfTI"))
+    NIfTI_mod = Base.require(Base.PkgId(Base.UUID("a3a9e032-41b5-5fc4-967a-a6b7a19844d3"), "NIfTI"))
     ni = NIfTI_mod.niread(path)
     return convert(Array{Float64}, ni.raw)
 end
@@ -212,7 +222,7 @@ end
 
 """
     save_result(path::AbstractString, data::AbstractArray;
-                header=nothing, voxel_size=nothing)
+                header=nothing, voxel_size=nothing, affine=nothing)
 
 Save an array to the specified output path. The format is auto-detected from
 the file extension.
@@ -226,17 +236,22 @@ the file extension.
   input file. If `nothing`, a default header is created.
 - `voxel_size`: Optional tuple `(dx, dy, dz)` specifying voxel dimensions.
   Used when creating new NIfTI/MGZ headers.
+- `affine`: Optional 3×3, 3×4, or 4×4 matrix encoding the spatial affine
+  (rotation × voxel spacing, plus optional translation). Written to the NIfTI
+  sform (sform_code = 1). If provided, `voxel_size` is still used for pixdim.
 """
 function save_result(path::AbstractString, data::AbstractArray;
                      header = nothing,
-                     voxel_size = nothing)
+                     voxel_size = nothing,
+                     affine = nothing)
     fmt = _detect_output_format(path)
-    return _save_result(Val(fmt), path, data; header = header, voxel_size = voxel_size)
+    return _save_result(Val(fmt), path, data; header = header, voxel_size = voxel_size,
+                        affine = affine)
 end
 
 # Fallback
 function _save_result(::Val{fmt}, path::AbstractString, data::AbstractArray;
-                      header = nothing, voxel_size = nothing) where {fmt}
+                      header = nothing, voxel_size = nothing, affine = nothing) where {fmt}
     pkg_map = Dict(
         :nifti    => "NIfTI",
         :nifti_gz => "NIfTI",
@@ -248,6 +263,69 @@ function _save_result(::Val{fmt}, path::AbstractString, data::AbstractArray;
     pkg = get(pkg_map, fmt, "the appropriate")
     error("Saving $fmt files requires $pkg.jl. " *
           "Install it with: using Pkg; Pkg.add(\"$pkg\")")
+end
+
+# ── NIfTI layout helper ───────────────────────────────────────────────────────
+# Neuroimaging convention: spatial dims (x,y,z) first, component dims last.
+# Input arrays from this package have components leading: (c..., nx, ny, nz).
+# This permutes to (nx, ny, nz, c...) and flattens >4D to 4D for compatibility
+# with readers that only support up to 4 dimensions (e.g. FreeSurfer niiRead).
+function _to_nifti_layout(data::AbstractArray)
+    nd = ndims(data)
+    nd == 3 && return data  # pure 3D — no permutation needed
+
+    # data has shape (comp_dims..., nx, ny, nz)
+    n_comp = nd - 3
+    perm    = (n_comp+1:nd..., 1:n_comp...)   # spatial first, then components
+    arr     = permutedims(data, perm)           # (nx, ny, nz, comp_dims...)
+
+    # Flatten to 4D for readers that don't support >4D NIfTI
+    if nd > 4
+        nx, ny, nz = size(arr, 1), size(arr, 2), size(arr, 3)
+        arr = reshape(arr, nx, ny, nz, :)
+    end
+    return arr
+end
+
+# NIfTI (.nii / .nii.gz) — niwrite auto-detects compression from extension
+function _save_result(::Val{:nifti}, path::AbstractString, data::AbstractArray;
+                      header = nothing, voxel_size = nothing, affine = nothing)
+    NIfTI_mod = Base.require(Base.PkgId(Base.UUID("a3a9e032-41b5-5fc4-967a-a6b7a19844d3"), "NIfTI"))
+    # Permute to (nx, ny, nz, components) and flatten to 4D for reader compatibility
+    arr = Array{Float32}(_to_nifti_layout(data))
+    ni  = voxel_size !== nothing ? NIfTI_mod.NIVolume(arr; voxel_size = voxel_size) :
+                                   NIfTI_mod.NIVolume(arr)
+    # Set qform_code = 1 (scanner RAS) so readers don't warn about invalid spatial form
+    ni.header.qform_code = Int16(1)
+    # Tag 3-frame volumes as vector fields (NIFTI_INTENT_VECTOR = 1007) so
+    # FreeView / FSL expose the vector/DEC display options automatically.
+    if ndims(arr) == 4 && size(arr, 4) == 3
+        ni.header.intent_code = Int16(1007)
+    end
+    # Write spatial orientation via sform when an affine is supplied.
+    # Accepts 3×3 (rotation×scale, no translation), 3×4, or 4×4.
+    if affine !== nothing
+        A = Float32.(affine)
+        t = size(A, 2) >= 4 ? (A[1,4], A[2,4], A[3,4]) : (0f0, 0f0, 0f0)
+        ni.header.sform_code = Int16(1)
+        ni.header.srow_x = (A[1,1], A[1,2], A[1,3], t[1])
+        ni.header.srow_y = (A[2,1], A[2,2], A[2,3], t[2])
+        ni.header.srow_z = (A[3,1], A[3,2], A[3,3], t[3])
+    end
+    NIfTI_mod.niwrite(path, ni)
+end
+
+function _save_result(::Val{:nifti_gz}, path::AbstractString, data::AbstractArray;
+                      header = nothing, voxel_size = nothing, affine = nothing)
+    _save_result(Val(:nifti), path, data; header = header, voxel_size = voxel_size,
+                 affine = affine)
+end
+
+# NPY — uses NPZ.jl
+function _save_result(::Val{:npy}, path::AbstractString, data::AbstractArray;
+                      header = nothing, voxel_size = nothing, affine = nothing)  # spatial kwargs unused for NPY
+    NPZ_mod = Base.require(Base.PkgId(Base.UUID("15e1cf62-19b3-5cfa-8e77-841668bca605"), "NPZ"))
+    NPZ_mod.npzwrite(path, data)
 end
 
 # ── High-level processing pipeline ──────────────────────────────────────────
@@ -278,6 +356,8 @@ various file formats without writing Julia code.
   `:nifti_gz`, `:mgz`, `:zarr`, `:ome_zarr`, `:npy`, `:array`.
 - `chunk_size::Union{Int, Nothing} = nothing`: If set, use chunked processing
   with the given block size. If `nothing`, process the whole volume at once.
+- `use_gpu::Bool = false`: If `true`, use GPU out-of-core chunked processing
+  (requires CUDA.jl). Forces `chunk_size` to 128 if not specified.
 - `truncate::Real = 4.0`: Gaussian truncation parameter.
 - `full::Bool = false`: Compute all eigenvectors (`true`) or just primary (`false`).
 - `eigenvalue_order::Symbol = :asc`: Eigenvalue ordering.
@@ -286,6 +366,9 @@ various file formats without writing Julia code.
 - `verbose::Bool = false`: Print progress information.
 - `voxel_size::Union{NTuple{3,<:Real}, Nothing} = nothing`: Voxel dimensions
   for output headers (e.g., `(0.1, 0.1, 0.1)` for 100μm isotropic).
+- `affine`: Optional 3×3, 3×4, or 4×4 spatial affine matrix (rotation × voxel
+  spacing + optional translation). Written to the NIfTI sform of every output.
+  Build it as `R .* voxel_size'` where `R` is a 3×3 rotation matrix.
 - `prefix::AbstractString = "st"`: Filename prefix for outputs.
 
 # Returns
@@ -327,6 +410,7 @@ function process_volume(input_path::AbstractString,
                         output_dir::Union{AbstractString, Nothing} = nothing,
                         output_format::Symbol = :nifti_gz,
                         chunk_size::Union{Int, Nothing} = nothing,
+                        use_gpu::Bool = false,
                         truncate::Real = 4.0,
                         full::Bool = false,
                         eigenvalue_order::Symbol = :asc,
@@ -334,6 +418,7 @@ function process_volume(input_path::AbstractString,
                         compute_eigen::Bool = true,
                         verbose::Bool = false,
                         voxel_size::Union{NTuple{3,<:Real}, Nothing} = nothing,
+                        affine = nothing,
                         prefix::AbstractString = "st")
     # ── Step 1: Load volume ──────────────────────────────────────────────
     if verbose
@@ -356,11 +441,16 @@ function process_volume(input_path::AbstractString,
             @info "Computing structure tensor (σ=$σ, ρ=$ρ)..."
         end
 
-        if chunk_size !== nothing
+        if use_gpu
+            S = structure_tensor_3d_chunked_gpu(volume, σ, ρ;
+                                                chunk_size = chunk_size !== nothing ? chunk_size : 128,
+                                                truncate   = truncate,
+                                                verbose    = verbose)
+        elseif chunk_size !== nothing
             S = structure_tensor_3d_chunked(volume, σ, ρ;
                                             chunk_size = chunk_size,
-                                            truncate = truncate,
-                                            verbose = verbose)
+                                            truncate   = truncate,
+                                            verbose    = verbose)
         else
             S = structure_tensor_3d(volume, σ, ρ; truncate = truncate)
         end
@@ -388,6 +478,17 @@ function process_volume(input_path::AbstractString,
     if output_dir !== nothing
         mkpath(output_dir)
 
+        # Save a NIfTI copy of the input when the source was not already NIfTI
+        # (e.g. TIFF directory, Zarr, MGZ). Useful as a spatial reference.
+        input_fmt = _detect_input_format(input_path)
+        if input_fmt ∉ (:nifti, :nifti_gz)
+            ipath = joinpath(output_dir, "$(prefix)_input.nii.gz")
+            if verbose
+                @info "Saving input volume as NIfTI: $ipath"
+            end
+            save_result(ipath, volume; voxel_size = voxel_size, affine = affine)
+        end
+
         # Determine file extension
         ext_map = Dict(
             :nifti    => ".nii",
@@ -404,7 +505,7 @@ function process_volume(input_path::AbstractString,
             if verbose
                 @info "Saving structure tensor to: $spath"
             end
-            save_result(spath, S; voxel_size = voxel_size)
+            save_result(spath, S; voxel_size = voxel_size, affine = affine)
         end
 
         if compute_eigen
@@ -413,7 +514,7 @@ function process_volume(input_path::AbstractString,
                 if verbose
                     @info "Saving eigenvalues to: $vpath"
                 end
-                save_result(vpath, val; voxel_size = voxel_size)
+                save_result(vpath, val; voxel_size = voxel_size, affine = affine)
             end
 
             if vec !== nothing
@@ -421,7 +522,7 @@ function process_volume(input_path::AbstractString,
                 if verbose
                     @info "Saving eigenvectors to: $vecpath"
                 end
-                save_result(vecpath, vec; voxel_size = voxel_size)
+                save_result(vecpath, vec; voxel_size = voxel_size, affine = affine)
             end
         end
 

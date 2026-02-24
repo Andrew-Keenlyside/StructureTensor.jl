@@ -383,4 +383,139 @@ end
     end
 end
 
+
+# ── GPU Out-of-Core Chunked Structure Tensor ─────────────────────────────────
+
+"""
+    StructureTensor.structure_tensor_3d_chunked_gpu(volume_cpu, σ, ρ;
+        chunk_size=128, truncate=4.0, verbose=false) → Array{Float64,4}
+
+GPU out-of-core chunked structure tensor for arbitrarily large volumes.
+
+The CPU volume is never fully resident on the GPU. Each chunk is:
+  1. Extracted from the CPU volume (with halo for correct boundary filtering)
+  2. Uploaded to the GPU as Float64 (no precision loss)
+  3. Processed with the GPU structure tensor kernel
+  4. Downloaded back to CPU (only the inner non-halo region)
+  5. GPU memory freed immediately after each chunk
+
+Peak GPU memory = one padded chunk + its 6-component output tensor.
+For `chunk_size=128` with typical σ/ρ (halo ≈ 20), peak ≈ 250 MB.
+
+# Arguments
+- `volume_cpu`: Input CPU array, any `<:Real` element type.
+- `σ`, `ρ`: Noise and integration Gaussian scales.
+
+# Keyword Arguments
+- `chunk_size::Int = 128`: Cubic chunk edge length in voxels.
+- `truncate::Real = 4.0`: Gaussian truncation parameter.
+- `verbose::Bool = false`: Print chunk-level progress.
+
+# Returns
+- `S::Array{Float64,4}` on CPU, shape `(6, nx, ny, nz)`.
+"""
+function StructureTensor.structure_tensor_3d_chunked_gpu(
+        volume_cpu::AbstractArray{<:Real, 3},
+        σ::Real, ρ::Real;
+        chunk_size::Int = 128,
+        truncate::Real  = 4.0,
+        verbose::Bool   = false)
+
+    @assert chunk_size > 0 "chunk_size must be positive, got $chunk_size."
+    dims = size(volume_cpu)
+    halo = StructureTensor._compute_halo(σ, ρ, truncate)
+
+    rx = StructureTensor._chunk_ranges(dims[1], chunk_size, halo)
+    ry = StructureTensor._chunk_ranges(dims[2], chunk_size, halo)
+    rz = StructureTensor._chunk_ranges(dims[3], chunk_size, halo)
+
+    chunk_list = [(ix, iy, iz)
+                  for ix in eachindex(rx)
+                  for iy in eachindex(ry)
+                  for iz in eachindex(rz)]
+    n_chunks = length(chunk_list)
+
+    if verbose
+        @info "GPU chunked ST: volume=$(dims), chunk_size=$chunk_size, " *
+              "halo=$halo, $n_chunks chunks total"
+    end
+
+    S_out = Array{Float64}(undef, 6, dims...)
+
+    for (ci, (ix, iy, iz)) in enumerate(chunk_list)
+        (pad_x, inner_x) = rx[ix]
+        (pad_y, inner_y) = ry[iy]
+        (pad_z, inner_z) = rz[iz]
+
+        # ── H2D: extract padded block, upload as Float64 (no precision loss) ──
+        block_gpu = CuArray{Float64}(volume_cpu[pad_x, pad_y, pad_z])
+
+        # ── GPU compute: returns CuArray{Float64,4} ──────────────────────────
+        S_block_gpu = StructureTensor.structure_tensor_3d(block_gpu, σ, ρ;
+                                                          truncate = truncate)
+        CUDA.unsafe_free!(block_gpu)   # free input immediately
+
+        # ── D2H: download full padded S block, then free GPU allocation ───────
+        S_block_cpu = Array(S_block_gpu)
+        CUDA.unsafe_free!(S_block_gpu)
+
+        # ── CPU-side extraction: copy inner (non-halo) region into output ──────
+        out_x = (first(pad_x) + first(inner_x) - 1):(first(pad_x) + last(inner_x) - 1)
+        out_y = (first(pad_y) + first(inner_y) - 1):(first(pad_y) + last(inner_y) - 1)
+        out_z = (first(pad_z) + first(inner_z) - 1):(first(pad_z) + last(inner_z) - 1)
+
+        @inbounds for c in 1:6
+            S_out[c, out_x, out_y, out_z] .= @view S_block_cpu[c, inner_x, inner_y, inner_z]
+        end
+
+        if verbose && (ci % max(1, n_chunks ÷ 10) == 0 || ci == n_chunks)
+            @info "  GPU progress: $ci / $n_chunks chunks"
+        end
+    end
+
+    verbose && @info "GPU chunked ST complete."
+    return S_out
+end
+
+"""
+    StructureTensor.parallel_structure_tensor_analysis_gpu(volume_cpu, σ, ρ;
+        chunk_size=128, truncate=4.0, full=false,
+        eigenvalue_order=:asc, include_S=true, verbose=false) → (S, val, vec)
+
+Combined GPU out-of-core structure tensor + CPU eigendecomposition.
+
+Structure tensor is computed chunk-by-chunk on the GPU
+(see [`structure_tensor_3d_chunked_gpu`](@ref)).
+Eigendecomposition runs on CPU with multithreading.
+
+# Returns
+- `S`: `Array{Float64,4}` `(6, nx, ny, nz)`, or `nothing` if `include_S=false`.
+- `val`: Eigenvalues `(3, nx, ny, nz)`.
+- `vec`: Eigenvectors `(3, nx, ny, nz)` or `(3, 3, nx, ny, nz)` if `full=true`.
+"""
+function StructureTensor.parallel_structure_tensor_analysis_gpu(
+        volume_cpu::AbstractArray{<:Real, 3},
+        σ::Real, ρ::Real;
+        chunk_size::Int        = 128,
+        truncate::Real         = 4.0,
+        full::Bool             = false,
+        eigenvalue_order::Symbol = :asc,
+        include_S::Bool        = true,
+        verbose::Bool          = false)
+
+    verbose && @info "Step 1/2: GPU chunked structure tensor..."
+    S = StructureTensor.structure_tensor_3d_chunked_gpu(volume_cpu, σ, ρ;
+                                                         chunk_size = chunk_size,
+                                                         truncate   = truncate,
+                                                         verbose    = verbose)
+
+    verbose && @info "Step 2/2: Eigendecomposition (CPU multithreaded)..."
+    val, vec = StructureTensor.eig_special_3d(S;
+                                               full             = full,
+                                               eigenvalue_order = eigenvalue_order)
+
+    verbose && @info "Analysis complete."
+    return include_S ? (S, val, vec) : (nothing, val, vec)
+end
+
 end # module CUDAExt

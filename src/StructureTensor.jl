@@ -56,6 +56,9 @@ export structure_tensor_3d,
        structure_tensor_3d_chunked,
        structure_tensor_3d_chunked_gpu,
        parallel_structure_tensor_analysis,
-       process_volume
+       parallel_structure_tensor_analysis_gpu,
+       process_volume,
+       save_result,
+       load_volume
 
 end # module StructureTensor
